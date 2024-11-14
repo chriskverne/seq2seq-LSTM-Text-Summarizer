@@ -15,16 +15,14 @@ from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
 
-
-nltk.download('stopwords')
-stop_words = set(stopwords.words('english'))
+#nltk.download('stopwords')
+#stop_words = set(stopwords.words('english'))
 device_num = 0
 
 print("CUDA available:", torch.cuda.is_available())
 print("Device name:", torch.cuda.get_device_name(device_num) if torch.cuda.is_available() else "No GPU")
-
-ds = load_dataset("EdinburghNLP/xsum")
 
 def clean_text(text):
   # Set to lower case
@@ -41,23 +39,8 @@ def clean_text(text):
   #text = ' '.join(words)
   return text
 
-ds = ds.map(lambda article: {
-    'document' : clean_text(article['document']),
-    'summary' : clean_text(article['summary'])
-})
-
-tokenizer = ByteLevelBPETokenizer(
-    "./vocab.json",
-    "./merges.txt"
-)
-
-tokenizer.add_special_tokens(["<pad>"])
-
-# Get the pad token ID
-pad_token_id = tokenizer.token_to_id('<pad>')
-
 # Tokenize our inputs
-def tokenize(paragraphs, doc_vec_size, sum_vec_size):
+def tokenize(paragraphs, doc_vec_size, sum_vec_size, tokenizer):
     # Tokenize the documents and summaries
     inputs = tokenizer.encode_batch(paragraphs['document'])
     summaries = tokenizer.encode_batch(paragraphs['summary'])
@@ -252,6 +235,25 @@ class ModelCheckpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         return checkpoint['epoch'], checkpoint['loss']
 
+def evaluate(model, data_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            target_ids = batch['labels'].to(device)
+            
+            output = model(input_ids, target_ids, teacher_forcing_ratio=0)
+            
+            output_dim = output.shape[-1]
+            output = output.view(-1, output_dim)
+            target_ids = target_ids.view(-1)
+            
+            loss = criterion(output, target_ids)
+            total_loss += loss.item()
+            
+    return total_loss / len(data_loader)
+
 def train_model(model, train_loader, val_loader, optimizer, criterion, num_epochs, 
                 checkpoint_handler, device, writer, teacher_forcing_ratio=0.5):
     best_val_loss = float('inf')
@@ -305,45 +307,53 @@ def main():
     writer = SummaryWriter('runs/summarizer_experiment')
     
     # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda:1")
+    else:
+        device = "cpu"
+
     print(f"Using device: {device}")
     
-    # Load and preprocess data
+    # Load and preprocess data (same as before)
     ds = load_dataset("EdinburghNLP/xsum")
-    
-    # Split training data into train and validation
+    ds = ds.map(lambda article: {
+        'document': clean_text(article['document']),
+        'summary': clean_text(article['summary'])
+    })
+
+    # Data preparation (same as before)
     train_size = 200000
-    val_size = 20000
+    val_size = 10000
     
     train_docs = [ds['train'][i]['document'] for i in range(train_size)]
     train_sums = [ds['train'][i]['summary'] for i in range(train_size)]
     
-    val_docs = [ds['validation'][i]['document'] for i in range(train_size, train_size + val_size)]
-    val_sums = [ds['validation'][i]['summary'] for i in range(train_size, train_size + val_size)]
+    val_docs = [ds['validation'][i]['document'] for i in range(val_size)]
+    val_sums = [ds['validation'][i]['summary'] for i in range(val_size)]
     
-    # Initialize tokenizer and create datasets
     tokenizer = ByteLevelBPETokenizer("./vocab.json", "./merges.txt")
     tokenizer.add_special_tokens(["<pad>"])
     
-    train_tokens = tokenize({'document': train_docs, 'summary': train_sums}, 512, 100)
-    val_tokens = tokenize({'document': val_docs, 'summary': val_sums}, 512, 100)
+    train_tokens = tokenize({'document': train_docs, 'summary': train_sums}, 512, 100, tokenizer)
+    val_tokens = tokenize({'document': val_docs, 'summary': val_sums}, 512, 100, tokenizer)
     
     train_dataset = SummaryDataset(train_tokens)
     val_dataset = SummaryDataset(val_tokens)
     
-    # Create data loaders
     batch_size = 128
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
-    # Initialize model components
+    # Initialize model components (same as before)
     embedding_dim = 300
     hidden_dim = 1536
-    num_layers = 5
+    num_layers = 6
     vocab_size = tokenizer.get_vocab_size()
     
-    encoder = LSTMEncoder(vocab_size, embedding_dim, hidden_dim, num_layers).to(device)
-    decoder = DecoderLSTM(vocab_size, embedding_dim, hidden_dim, num_layers).to(device)
+    pretrained_embeddings = load_pretrained_embeddings("./glove.6B.300d.txt", tokenizer, embedding_dim).to(device)
+
+    encoder = LSTMEncoder(vocab_size, embedding_dim, hidden_dim, num_layers, pretrained_embeddings).to(device)
+    decoder = DecoderLSTM(vocab_size, embedding_dim, hidden_dim, num_layers, pretrained_embeddings).to(device)
     model = Seq2Seq(encoder, decoder, tokenizer, device).to(device)
     
     # Initialize optimizer and loss
@@ -351,7 +361,15 @@ def main():
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id('<pad>'))
     
     # Initialize checkpoint handler
-    checkpoint_handler = ModelCheckpoint('checkpoints')
+    checkpoint_handler = ModelCheckpoint('./model_checkpoints')
+    
+    # Load checkpoint from epoch 5
+    checkpoint_path = './model_checkpoints/summarizer_checkpoint_epoch_5.pt'
+    start_epoch, last_loss = checkpoint_handler.load(model, optimizer, checkpoint_path)
+    print(f"Resuming training from epoch {start_epoch} with loss {last_loss}")
+    
+    # Continue training for remaining epochs (assuming you want to train for 30 total epochs)
+    remaining_epochs = 30 - (start_epoch + 1)
     
     # Train the model
     train_model(
@@ -360,13 +378,13 @@ def main():
         val_loader=val_loader,
         optimizer=optimizer,
         criterion=criterion,
-        num_epochs=30,
+        num_epochs=remaining_epochs,  # Only train for remaining epochs
         checkpoint_handler=checkpoint_handler,
         device=device,
         writer=writer
     )
     
-    # Test the model on some examples
+    # Test the model (same as before)
     test_docs = [ds['test'][i]['document'] for i in range(10)]
     
     print("\nGenerating test summaries:")
@@ -378,133 +396,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-"""
-# Model training
-docs = [ds['train'][i]['document'] for i in range(200000)]
-sums = [ds['train'][i]['summary'] for i in range(200000)]
-
-# Tokenize the dataset
-tokens = tokenize({'document': docs, 'summary': sums}, 512, 100)
-
-# Create a SummaryDataset instance
-dataset = SummaryDataset(tokens)
-
-batch_size = 128
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# Define model parameters
-embedding_dim = 300
-hidden_dim = 1536
-num_layers = 5
-vocab_size = tokenizer.get_vocab_size()
-learning_rate = 0.001
-num_epochs = 30
-teacher_forcing_ratio = 0.5
-
-pretrained_embedding_path = './glove.6B.300d.txt'
-pretrained_embeddings = load_pretrained_embeddings(pretrained_embedding_path, tokenizer, embedding_dim)
-
-# Initialize models
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-encoder = LSTMEncoder(vocab_size, embedding_dim, hidden_dim, num_layers).to(device)
-decoder = DecoderLSTM(vocab_size, embedding_dim, hidden_dim, num_layers).to(device)
-model = Seq2Seq(encoder, decoder, tokenizer, device).to(device)
-
-# Optimizer and loss function
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
-
-# Training function
-def train(model, data_loader):
-    model.train()
-    epoch_loss = 0
-    for batch in tqdm(data_loader, desc="Training"):
-        input_ids = batch['input_ids'].to(device)
-        target_ids = batch['labels'].to(device)
-
-        optimizer.zero_grad()
-
-        # Forward pass
-        output = model(input_ids, target_ids, teacher_forcing_ratio)
-
-        # Reshape output and target for calculating loss
-        output_dim = output.shape[-1]
-        output = output.view(-1, output_dim)
-        target_ids = target_ids.view(-1)
-
-        # Calculate loss
-        loss = criterion(output, target_ids)
-        loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5)
-
-        optimizer.step()
-        epoch_loss += loss.item()
-
-    return epoch_loss / len(data_loader)
-
-start_epoch = 0
-for epoch in range(start_epoch, num_epochs):
-    print(f"Epoch {epoch + 1}/{num_epochs}")
-    train_loss = train(model, data_loader)
-    print(f"Training Loss: {train_loss:.4f}")
-    #save_checkpoint(model, optimizer, epoch)
-
-def generate_summary(model, document, max_summary_length=100):
-    # Tokenize the document using encode, then pad and truncate manually
-    model.eval()
-    tokenized_doc = tokenizer.encode(document)
-    
-    # Truncate and pad manually to match your max_length setting
-    input_ids = tokenized_doc.ids[:512]  # Truncate to max_length of 512
-    input_ids += [pad_token_id] * (512 - len(input_ids))  # Pad to length of 512
-
-    # Convert to PyTorch tensor and move to the correct device
-    input_ids = torch.tensor([input_ids], dtype=torch.long).to(device)
-
-    # Encode the input document
-    with torch.no_grad():
-        encoder_outputs, (hidden, cell) = model.encoder(input_ids)
-
-    # Initialize decoder input with <s> token
-    start_token_id = tokenizer.token_to_id("<s>")
-    decoder_input = torch.full((1, 1), start_token_id, dtype=torch.long).to(device)
-    summary_tokens = []
-
-    # Greedily decode up to max_summary_length
-    for _ in range(max_summary_length):
-        with torch.no_grad():
-            decoder_output, hidden, cell = model.decoder(decoder_input, hidden, cell)
-            next_token = decoder_output.argmax(2)
-            summary_tokens.append(next_token.item())
-
-            # Stop if we reach the end of the sequence
-            if next_token.item() == tokenizer.token_to_id("</s>"):  # Replace with your end token
-                break
-
-            # Use the next token as the next input to the decoder
-            decoder_input = next_token
-
-    # Decode the generated tokens to text
-    summary = tokenizer.decode(summary_tokens, skip_special_tokens=True)
-    return summary
-
-
-# Example documents for testing
-test_docs = []
-
-for i in range(200):
-  test_docs.append(ds['train'][i]['document'])
-
-# Generate and print summaries
-for i, doc in enumerate(test_docs):
-    summary = generate_summary(model, doc)
-    print(f"Document {i + 1}: {doc}")
-    print(f"Summary {i + 1}: {summary}")
-    print("-" * 50)
-"""
