@@ -211,6 +211,7 @@ class ModelCheckpoint:
         self.save_dir = Path(save_dir)
         self.model_name = model_name
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.last_checkpoint_path = None
         
     def save(self, model, optimizer, epoch, loss, is_best=False):
         checkpoint = {
@@ -220,9 +221,14 @@ class ModelCheckpoint:
             'loss': loss,
         }
         
-        # Save regular checkpoint
+        # Delete previous checkpoint if it exists
+        if self.last_checkpoint_path is not None and self.last_checkpoint_path.exists():
+            self.last_checkpoint_path.unlink()
+        
+        # Save new checkpoint
         checkpoint_path = self.save_dir / f"{self.model_name}_checkpoint_epoch_{epoch}.pt"
         torch.save(checkpoint, checkpoint_path)
+        self.last_checkpoint_path = checkpoint_path
         
         # If this is the best model so far, save it separately
         if is_best:
@@ -233,6 +239,8 @@ class ModelCheckpoint:
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Update last_checkpoint_path when loading
+        self.last_checkpoint_path = Path(checkpoint_path)
         return checkpoint['epoch'], checkpoint['loss']
 
 def evaluate(model, data_loader, criterion, device):
@@ -308,7 +316,7 @@ def main():
     
     # Set up device
     if torch.cuda.is_available():
-        device = torch.device("cuda:1")
+        device = torch.device("cuda:2")
     else:
         device = "cpu"
 
@@ -364,7 +372,7 @@ def main():
     checkpoint_handler = ModelCheckpoint('./model_checkpoints')
     
     # Load checkpoint from epoch 5
-    checkpoint_path = './model_checkpoints/summarizer_checkpoint_epoch_5.pt'
+    checkpoint_path = './model_checkpoints/summarizer_checkpoint_epoch_4.pt'
     start_epoch, last_loss = checkpoint_handler.load(model, optimizer, checkpoint_path)
     print(f"Resuming training from epoch {start_epoch} with loss {last_loss}")
     
