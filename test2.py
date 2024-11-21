@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 from datetime import datetime
+from transformers import get_cosine_schedule_with_warmup  # Add this import at the top
 
 # Setup
 nltk.download('stopwords', quiet=True)
@@ -21,19 +22,22 @@ tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
 class Config:
     def __init__(self):
-        self.batch_size = 96
+        self.batch_size = 128
         self.embedding_dim = 512
         self.hidden_dim = 768
-        self.num_layers = 5
+        self.num_layers = 4
         self.dropout_rate = 0.1
         self.learning_rate = 0.0001
-        self.num_epochs = 30
+        self.num_epochs = 35
         self.beam_width = 5
         self.clip = 1.0
         self.teacher_forcing_ratio = 0.7
         self.doc_max_length = 512
         self.sum_max_length = 128
-        self.device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+        self.weight_decay = 0.01
+        self.label_smoothing = 0.1
+        self.gradient_accumulation_steps = 2
 
 class EnhancedLSTMEncoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, dropout_rate=0.2):
@@ -206,15 +210,15 @@ def generate_summary(model, text, max_length=100, beam_width=5):
     summary = tokenizer.decode(output_ids, skip_special_tokens=True)
     return summary
 
-def save_checkpoint(model, optimizer, epoch, val_loss, is_best):
+def save_checkpoint(model, optimizer, epoch, train_loss, is_best):
     """
-    Save model checkpoint, keeping only the best model based on validation loss.
+    Save model checkpoint, keeping only the best model based on training loss.
     """
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_loss,
+        'train_loss': train_loss,
     }
     
     # Create checkpoint directory if it doesn't exist
@@ -227,7 +231,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, is_best):
             os.remove(checkpoint_path)
         # Save new best checkpoint
         torch.save(checkpoint, checkpoint_path)
-        print(f"Saved new best checkpoint with validation loss: {val_loss:.4f}")
+        print(f"Saved new best checkpoint with training loss: {train_loss:.4f}")
 
 def generate_test_summaries(model, config):
     """
@@ -318,38 +322,60 @@ def prepare_data():
     return train_encodings, val_encodings
 
 def train_model(model, train_loader, val_loader, optimizer, criterion, config):
-    best_val_loss = float('inf')
+    best_train_loss = float('inf')
     train_losses = []
     val_losses = []
     
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.1, patience=2, verbose=True
+    # Add gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
+    
+    # Add warmup scheduler
+    num_training_steps = len(train_loader) * config.num_epochs
+    num_warmup_steps = num_training_steps // 10  # 10% of total steps for warmup
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps
     )
     
     for epoch in range(config.num_epochs):
         model.train()
         train_loss = 0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}"):
+        # Add progress tracking
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        
+        for batch in progress_bar:
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(config.device)
             labels = batch['labels'].to(config.device)
             
-            outputs = model(input_ids, labels, config.teacher_forcing_ratio)
-            outputs = outputs.view(-1, outputs.shape[-1])
-            labels = labels.view(-1)
+            # Add mixed precision training
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids, labels, config.teacher_forcing_ratio)
+                outputs = outputs.view(-1, outputs.shape[-1])
+                labels = labels.view(-1)
+                loss = criterion(outputs, labels)
             
-            loss = criterion(outputs, labels)
-            loss.backward()
+            # Scale gradients and optimize
+            scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             train_loss += loss.item()
+            
+            # Update progress bar
+            progress_bar.set_postfix({'train_loss': f"{loss.item():.4f}"})
+            
+            # Update learning rate with warmup scheduler
+            scheduler.step()
         
         avg_train_loss = train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
-        # Validation
+        # Validation phase
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -367,15 +393,15 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, config):
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
-        # Save checkpoint if validation loss improved
-        is_best = avg_val_loss < best_val_loss
+        # Save checkpoint if training loss improved
+        is_best = avg_train_loss < best_train_loss
         if is_best:
-            best_val_loss = avg_val_loss
+            best_train_loss = avg_train_loss
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
-                val_loss=avg_val_loss,
+                train_loss=avg_train_loss,
                 is_best=True
             )
         
@@ -383,19 +409,14 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, config):
         print(f"\nEpoch {epoch+1}")
         print(f"Average Train Loss: {avg_train_loss:.4f}")
         print(f"Average Val Loss: {avg_val_loss:.4f}")
-        print(f"Best Val Loss: {best_val_loss:.4f}")
+        print(f"Best Train Loss: {best_train_loss:.4f}")
         
-        scheduler.step(avg_val_loss)
-        
-        if optimizer.param_groups[0]['lr'] < 1e-6:
-            print("\nLearning rate too small. Stopping training.")
-            break
+        # Early stopping
+        if epoch > 5 and all(train_losses[-1] > loss for loss in train_losses[-6:-1]):
+            print("\nTraining loss hasn't improved for 5 epochs.")
+            #break
     
-    # Generate test summaries after training is complete
-    print("\nGenerating test summaries...")
-    generate_test_summaries(model, config)
-    
-    return train_losses, val_losses, best_val_loss
+    return train_losses, val_losses, best_train_loss
 
 if __name__ == "__main__":
     # Initialize configuration
