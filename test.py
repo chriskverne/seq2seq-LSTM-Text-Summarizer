@@ -41,7 +41,7 @@ class EnhancedLSTMEncoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.lstm = nn.LSTM(
             embedding_dim,
-            hidden_dim // 2,
+            hidden_dim // 2,  # Keep this as hidden_dim // 2 for bidirectional
             num_layers,
             batch_first=True,
             bidirectional=True,
@@ -49,19 +49,22 @@ class EnhancedLSTMEncoder(nn.Module):
         )
         self.dropout = nn.Dropout(dropout_rate)
         self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.num_layers = num_layers
         
     def forward(self, src):
         embedded = self.dropout(self.embedding(src))
         outputs, (hidden, cell) = self.lstm(embedded)
         outputs = self.layer_norm(outputs)
-        hidden = self._reshape_hidden(hidden)
-        cell = self._reshape_hidden(cell)
+        
+        # Properly reshape hidden and cell states for the decoder
+        # For each layer, concatenate forward and backward states
+        hidden = hidden.view(self.num_layers, 2, -1, hidden.size(2))  # [num_layers, 2, batch, hidden_dim//2]
+        hidden = torch.cat([hidden[:, 0, :, :], hidden[:, 1, :, :]], dim=2)  # [num_layers, batch, hidden_dim]
+        
+        cell = cell.view(self.num_layers, 2, -1, cell.size(2))
+        cell = torch.cat([cell[:, 0, :, :], cell[:, 1, :, :]], dim=2)
+        
         return outputs, (hidden, cell)
-    
-    def _reshape_hidden(self, hidden):
-        num_layers = hidden.shape[0] // 2
-        hidden = torch.cat([hidden[2*i:2*i+2] for i in range(num_layers)], dim=2)
-        return hidden
 
 class ImprovedAttention(nn.Module):
     def __init__(self, hidden_dim):
@@ -270,10 +273,10 @@ def prepare_data():
     ds = load_dataset("EdinburghNLP/xsum")
     
     # Use small subset for testing - change slice size for full training
-    train_docs = [clean_text(doc['document']) for doc in ds['train']]
-    train_sums = [clean_text(doc['summary']) for doc in ds['train']]
-    val_docs = [clean_text(doc['document']) for doc in ds['validation']]
-    val_sums = [clean_text(doc['summary']) for doc in ds['validation']]
+    train_docs = [clean_text(ds['train'][i]['document']) for i in range(len(ds['train']))]
+    train_sums = [clean_text(ds['train'][i]['summary']) for i in range(len(ds['train']))]
+    val_docs = [clean_text(ds['validation'][i]['document']) for i in range(len(ds['validation']))]
+    val_sums = [clean_text(ds['validation'][i]['summary']) for i in range(len(ds['validation']))]
     
     train_encodings = tokenizer(
         train_docs,
