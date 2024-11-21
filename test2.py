@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 from datetime import datetime
-from transformers import get_cosine_schedule_with_warmup  # Add this import at the top
+from transformers import get_cosine_schedule_with_warmup
 
 # Setup
 nltk.download('stopwords', quiet=True)
@@ -22,19 +22,19 @@ tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
 class Config:
     def __init__(self):
-        self.batch_size = 128
-        self.embedding_dim = 512
-        self.hidden_dim = 768
+        self.batch_size = 96
+        self.embedding_dim = 384
+        self.hidden_dim = 512
         self.num_layers = 4
-        self.dropout_rate = 0.1
-        self.learning_rate = 0.0001
-        self.num_epochs = 35
+        self.dropout_rate = 0.2
+        self.learning_rate = 0.0002
+        self.num_epochs = 30
         self.beam_width = 5
         self.clip = 1.0
         self.teacher_forcing_ratio = 0.7
-        self.doc_max_length = 512
+        self.doc_max_length = 768 
         self.sum_max_length = 128
-        self.device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
         self.weight_decay = 0.01
         self.label_smoothing = 0.1
         self.gradient_accumulation_steps = 2
@@ -222,11 +222,11 @@ def save_checkpoint(model, optimizer, epoch, train_loss, is_best):
     }
     
     # Create checkpoint directory if it doesn't exist
-    os.makedirs('./model_checkpoints2', exist_ok=True)
+    os.makedirs('./model_checkpoints3', exist_ok=True)
     
     if is_best:
         # Remove previous best checkpoint if it exists
-        checkpoint_path = './model_checkpoints2/best_checkpoint.pt'
+        checkpoint_path = './model_checkpoints3/best_checkpoint.pt'
         if os.path.exists(checkpoint_path):
             os.remove(checkpoint_path)
         # Save new best checkpoint
@@ -241,15 +241,15 @@ def generate_test_summaries(model, config):
     ds = load_dataset("EdinburghNLP/xsum")
     
     # Create output directory if it doesn't exist
-    os.makedirs('./model_outputs', exist_ok=True)
+    os.makedirs('./model_outputs2', exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f'./model_outputs/test_summaries_{timestamp}.txt'
+    output_file = f'./model_outputs2/test_summaries_{timestamp}.txt'
     
     with open(output_file, 'w', encoding='utf-8') as f:
         for i in tqdm(range(1000), desc="Generating test summaries"):
-            article = ds['test'][i]['document']
-            real_summary = ds['test'][i]['summary']
+            article = ds['train'][i]['document']
+            real_summary = ds['train'][i]['summary']
             
             # Generate summary
             generated_summary = generate_summary(
@@ -471,7 +471,7 @@ if __name__ == "__main__":
     else:
         # Load the best model for evaluation
         print("Loading best model for evaluation...")
-        checkpoint_path = './model_checkpoints2/best_checkpoint.pt'
+        checkpoint_path = './model_checkpoints3/best_checkpoint.pt'
         
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError("No saved model found! Please train the model first.")
