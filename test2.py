@@ -59,9 +59,6 @@ class EnhancedLSTMEncoder(nn.Module):
         embedded = self.dropout(self.embedding(src))
         outputs, (hidden, cell) = self.lstm(embedded)
         outputs = self.layer_norm(outputs)
-        
-        # Properly reshape hidden and cell states for the decoder
-        # For each layer, concatenate forward and backward states
         hidden = hidden.view(self.num_layers, 2, -1, hidden.size(2))  # [num_layers, 2, batch, hidden_dim//2]
         hidden = torch.cat([hidden[:, 0, :, :], hidden[:, 1, :, :]], dim=2)  # [num_layers, batch, hidden_dim]
         
